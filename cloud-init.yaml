@@ -1,0 +1,186 @@
+#cloud-config
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+  - docker.io
+
+write_files:
+  - path: /etc/docker/daemon.json
+    owner: root:root
+    permissions: "0644"
+    content: |
+      {
+        "data-root": "/data/docker",
+        "log-driver": "json-file",
+        "log-opts": {
+          "max-size": "10m",
+          "max-file": "3"
+        }
+      }
+
+  - path: /opt/kubernetes/hello-world.yaml
+    owner: root:root
+    permissions: "0644"
+    content: |
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: hello-world-html
+      data:
+        index.html: |
+          <!doctype html>
+          <html lang="en">
+            <head>
+              <meta charset="utf-8">
+              <title>Azure Minikube Lab</title>
+            </head>
+            <body style="font-family: Arial; text-align: center; margin-top: 80px;">
+              <h1>${hello_message}</h1>
+              <p>Terraform -> cloud-init -> Minikube -> Kubernetes -> nginx</p>
+            </body>
+          </html>
+      ---
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: hello-world
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: hello-world
+        template:
+          metadata:
+            labels:
+              app: hello-world
+          spec:
+            containers:
+              - name: nginx
+                image: nginx:alpine
+                ports:
+                  - containerPort: 80
+                readinessProbe:
+                  httpGet:
+                    path: /
+                    port: 80
+                  initialDelaySeconds: 3
+                  periodSeconds: 5
+                livenessProbe:
+                  httpGet:
+                    path: /
+                    port: 80
+                  initialDelaySeconds: 10
+                  periodSeconds: 10
+                volumeMounts:
+                  - name: html
+                    mountPath: /usr/share/nginx/html/index.html
+                    subPath: index.html
+            volumes:
+              - name: html
+                configMap:
+                  name: hello-world-html
+      ---
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: hello-world
+      spec:
+        selector:
+          app: hello-world
+        ports:
+          - name: http
+            port: 80
+            targetPort: 80
+
+  - path: /etc/systemd/system/hello-world-port-forward.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Expose the Minikube Hello World service on VM port 8080
+      After=network-online.target docker.service
+      Wants=network-online.target
+      Requires=docker.service
+
+      [Service]
+      Type=simple
+      User=${admin_username}
+      Environment=HOME=/home/${admin_username}
+      Environment=KUBECONFIG=/home/${admin_username}/.kube/config
+      ExecStart=/usr/local/bin/kubectl port-forward --address=0.0.0.0 service/hello-world 8080:80
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /usr/local/sbin/setup-minikube-lab.sh
+    owner: root:root
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euxo pipefail
+
+      DATA_DISK=/dev/disk/azure/scsi1/lun0
+
+      for attempt in $(seq 1 120); do
+        if [ -b "$DATA_DISK" ]; then
+          break
+        fi
+        echo "Waiting for Azure data disk on LUN 0: attempt $attempt/120"
+        sleep 5
+      done
+
+      if [ ! -b "$DATA_DISK" ]; then
+        echo "Azure data disk on LUN 0 was not attached within 10 minutes" >&2
+        exit 1
+      fi
+
+      systemctl stop docker.service docker.socket containerd.service || true
+
+      FILESYSTEM_TYPE=$(blkid -s TYPE -o value "$DATA_DISK" || true)
+      if [ -z "$FILESYSTEM_TYPE" ]; then
+        mkfs.ext4 -F "$DATA_DISK"
+      elif [ "$FILESYSTEM_TYPE" != "ext4" ]; then
+        echo "Refusing to use LUN 0 because it contains $FILESYSTEM_TYPE instead of ext4" >&2
+        exit 1
+      fi
+
+      DISK_UUID=$(blkid -s UUID -o value "$DATA_DISK")
+      mkdir -p /data
+      if ! grep -q "UUID=$DISK_UUID /data " /etc/fstab; then
+        echo "UUID=$DISK_UUID /data ext4 defaults,nofail 0 2" >> /etc/fstab
+      fi
+      mountpoint -q /data || mount /data
+      mkdir -p /data/docker
+
+      if [ -d /var/lib/docker ] && [ "$(find /var/lib/docker -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+        cp -a /var/lib/docker/. /data/docker/
+      fi
+
+      systemctl enable --now docker
+      usermod -aG docker ${admin_username}
+
+      curl -fsSLo /tmp/minikube-linux-amd64 https://github.com/kubernetes/minikube/releases/latest/download/minikube-linux-amd64
+      install -o root -g root -m 0755 /tmp/minikube-linux-amd64 /usr/local/bin/minikube
+      rm -f /tmp/minikube-linux-amd64
+
+      KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+      curl -fsSLo /tmp/kubectl https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl
+      curl -fsSLo /tmp/kubectl.sha256 https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl.sha256
+      echo "$(cat /tmp/kubectl.sha256)  /tmp/kubectl" | sha256sum --check
+      install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+      rm -f /tmp/kubectl /tmp/kubectl.sha256
+
+      sudo -iu ${admin_username} minikube start --driver=docker --container-runtime=containerd --cpus=2 --memory=4096mb --disk-size=20g
+      sudo -iu ${admin_username} kubectl apply -f /opt/kubernetes/hello-world.yaml
+      sudo -iu ${admin_username} kubectl rollout status deployment/hello-world --timeout=180s
+
+      systemctl daemon-reload
+      systemctl enable --now hello-world-port-forward.service
+
+runcmd:
+  - [/usr/local/sbin/setup-minikube-lab.sh]
+
+final_message: "cloud-init finished after $UPTIME seconds"
